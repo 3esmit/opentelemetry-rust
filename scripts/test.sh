@@ -9,6 +9,15 @@ set -eu
 echo "Running tests for all packages in workspace with --all-features"
 cargo test --workspace --all-features --lib
 
+bash ./scripts/test_validation_scripts.sh
+
+# Workspace feature unification can hide missing feature gates in SDK tests.
+echo "Running SDK library tests with default features"
+cargo test --manifest-path=opentelemetry-sdk/Cargo.toml --lib
+
+echo "Running SDK library tests with trace only"
+cargo test --manifest-path=opentelemetry-sdk/Cargo.toml --no-default-features --features trace --lib
+
 echo "Running doctests for all packages in workspace with --all-features"
 cargo test --workspace --all-features --doc --exclude opentelemetry-proto
 
