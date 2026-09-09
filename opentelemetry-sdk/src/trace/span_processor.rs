@@ -422,7 +422,17 @@ impl BatchSpanProcessor {
                                     &current_batch_size,
                                     &config,
                                 );
-                                let _ = exporter.shutdown();
+                                // Always shut down the exporter, even if the final
+                                // drain failed, and retain both causes if needed.
+                                let result = match (result, exporter.shutdown()) {
+                                    (Err(export), Err(shutdown)) => {
+                                        Err(OTelSdkError::InternalFailure(format!(
+                                            "Final span export failed: {export}; exporter shutdown failed: {shutdown}"
+                                        )))
+                                    }
+                                    (Err(err), _) | (_, Err(err)) => Err(err),
+                                    (Ok(()), Ok(())) => Ok(()),
+                                };
                                 let _ = sender.send(result);
 
                                 otel_debug!(
@@ -531,7 +541,12 @@ impl BatchSpanProcessor {
             }
             total_exported_spans += count_of_spans;
 
-            result = Self::export_batch_sync(exporter, spans, last_export_time); // This method clears the spans vec after exporting
+            // This clears the spans vec after exporting. Drain every batch,
+            // but do not let a later success hide a failure.
+            let export_result = Self::export_batch_sync(exporter, spans, last_export_time);
+            if result.is_ok() {
+                result = export_result;
+            }
 
             current_batch_size.fetch_sub(count_of_spans, Ordering::AcqRel);
         }
@@ -703,13 +718,13 @@ impl SpanProcessor for BatchSpanProcessor {
             Ok(_) => {
                 receiver
                     .recv_timeout(timeout)
-                    .map(|_| {
+                    .map(|result| {
                         // join the background thread after receiving back the
                         // shutdown signal
                         if let Some(handle) = self.handle.lock().unwrap().take() {
                             handle.join().unwrap();
                         }
-                        OTelSdkResult::Ok(())
+                        result
                     })
                     .map_err(|err| match err {
                         std::sync::mpsc::RecvTimeoutError::Timeout => {
@@ -994,7 +1009,7 @@ mod tests {
         OTEL_BSP_MAX_EXPORT_BATCH_SIZE, OTEL_BSP_MAX_QUEUE_SIZE, OTEL_BSP_MAX_QUEUE_SIZE_DEFAULT,
         OTEL_BSP_SCHEDULE_DELAY, OTEL_BSP_SCHEDULE_DELAY_DEFAULT,
     };
-    use crate::error::OTelSdkResult;
+    use crate::error::{OTelSdkError, OTelSdkResult};
     use crate::testing::trace::new_test_export_span_data;
     use crate::trace::span_processor::{
         OTEL_BSP_EXPORT_TIMEOUT_DEFAULT, OTEL_BSP_MAX_CONCURRENT_EXPORTS,
@@ -1354,6 +1369,215 @@ mod tests {
 
         assert_eq!(1, exporter.get_finished_spans().unwrap().len());
         assert!(exporter.is_shutdown_called());
+    }
+
+    #[rstest::rstest]
+    #[case::first_batch(0)]
+    #[case::last_batch(1)]
+    fn batchspanprocessor_drain_preserves_any_export_error(
+        #[case] failed_batch: usize,
+    ) -> OTelSdkResult {
+        #[derive(Debug)]
+        struct FailingBatchExporter {
+            failed_batch: usize,
+            calls: AtomicUsize,
+        }
+
+        impl SpanExporter for FailingBatchExporter {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                assert_eq!(batch.len(), 1);
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                if call == self.failed_batch {
+                    Err(OTelSdkError::InternalFailure(format!(
+                        "batch {call} rejected"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let exporter = FailingBatchExporter {
+            failed_batch,
+            calls: AtomicUsize::new(0),
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        for name in ["first", "last"] {
+            sender
+                .send(create_test_span(name))
+                .map_err(|err| OTelSdkError::InternalFailure(err.to_string()))?;
+        }
+        let current_batch_size = AtomicUsize::new(2);
+        let config = BatchConfigBuilder::default()
+            .with_max_export_batch_size(1)
+            .build();
+        let result = BatchSpanProcessor::get_spans_and_export(
+            &receiver,
+            &exporter,
+            &mut Vec::new(),
+            &mut Instant::now(),
+            &current_batch_size,
+            &config,
+        );
+
+        assert_eq!(exporter.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(current_batch_size.load(Ordering::Relaxed), 0);
+        assert!(
+            matches!(result, Err(OTelSdkError::InternalFailure(message)) if message == format!("batch {failed_batch} rejected"))
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct ShutdownResultExporter {
+        export_fails: bool,
+        shutdown_fails: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SpanExporter for ShutdownResultExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            assert_eq!(batch.len(), 1);
+            self.events.lock()?.push("export");
+            if self.export_fails {
+                Err(OTelSdkError::InternalFailure(
+                    "final export rejected".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn shutdown(&self) -> OTelSdkResult {
+            self.events.lock()?.push("shutdown");
+            if self.shutdown_fails {
+                Err(OTelSdkError::Timeout(Duration::from_secs(3)))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for ShutdownResultExporter {
+        fn drop(&mut self) {
+            if let Ok(mut events) = self.events.lock() {
+                events.push("drop");
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::success(true, false, false)]
+    #[case::export_error(true, true, false)]
+    #[case::shutdown_error(true, false, true)]
+    #[case::both_errors(true, true, true)]
+    #[case::empty_success(false, false, false)]
+    #[case::empty_shutdown_error(false, false, true)]
+    fn batchspanprocessor_shutdown_preserves_results(
+        #[case] has_span: bool,
+        #[case] export_fails: bool,
+        #[case] shutdown_fails: bool,
+    ) -> OTelSdkResult {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let exporter = ShutdownResultExporter {
+            export_fails,
+            shutdown_fails,
+            events: events.clone(),
+        };
+        let config = BatchConfigBuilder::default()
+            .with_scheduled_delay(Duration::from_secs(3600))
+            .build();
+        let processor = BatchSpanProcessor::new(exporter, config);
+        if has_span {
+            processor.on_end(create_test_span("final_span"));
+        }
+
+        // No force_flush: this must exercise the final drain owned by shutdown.
+        let result = processor.shutdown();
+
+        // Exporter destruction happens after the worker's reply. Observing it
+        // here verifies that shutdown joins the worker, including on errors.
+        let expected_events = if has_span {
+            vec!["export", "shutdown", "drop"]
+        } else {
+            vec!["shutdown", "drop"]
+        };
+        assert_eq!(*events.lock()?, expected_events);
+        assert!(processor.handle.lock()?.is_none());
+        assert!(matches!(
+            processor.shutdown(),
+            Err(OTelSdkError::AlreadyShutdown)
+        ));
+
+        match (export_fails, shutdown_fails, result) {
+            (false, false, Ok(())) => {}
+            (true, false, Err(OTelSdkError::InternalFailure(message))) => {
+                assert_eq!(message, "final export rejected");
+            }
+            (false, true, Err(OTelSdkError::Timeout(timeout))) => {
+                assert_eq!(timeout, Duration::from_secs(3));
+            }
+            (true, true, Err(OTelSdkError::InternalFailure(message))) => {
+                assert!(message.contains("final export rejected"));
+                assert!(
+                    message.contains(&OTelSdkError::Timeout(Duration::from_secs(3)).to_string())
+                );
+            }
+            unexpected => {
+                return Err(OTelSdkError::InternalFailure(format!(
+                    "unexpected shutdown result: {unexpected:?}"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batchspanprocessor_shutdown_timeout_does_not_wait_for_exporter() -> OTelSdkResult {
+        #[derive(Debug)]
+        struct BlockedShutdownExporter {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl SpanExporter for BlockedShutdownExporter {
+            async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+                Ok(())
+            }
+
+            fn shutdown(&self) -> OTelSdkResult {
+                self.entered
+                    .send(())
+                    .map_err(|err| OTelSdkError::InternalFailure(err.to_string()))?;
+                self.release
+                    .lock()?
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|err| OTelSdkError::InternalFailure(err.to_string()))
+            }
+        }
+
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let processor = BatchSpanProcessor::new(
+            BlockedShutdownExporter {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+            },
+            BatchConfig::default(),
+        );
+
+        let result = processor.shutdown_with_timeout(Duration::ZERO);
+        let entered = entered_receiver.recv_timeout(Duration::from_secs(5));
+        let released = release_sender.send(());
+        // A timeout stops waiting, not the worker. Release and join this test's
+        // worker explicitly so it cannot escape into another test.
+        if let Some(handle) = processor.handle.lock()?.take() {
+            assert!(handle.join().is_ok());
+        }
+        assert!(entered.is_ok());
+        assert!(released.is_ok());
+        assert!(matches!(result, Err(OTelSdkError::Timeout(Duration::ZERO))));
+        Ok(())
     }
 
     #[test]
