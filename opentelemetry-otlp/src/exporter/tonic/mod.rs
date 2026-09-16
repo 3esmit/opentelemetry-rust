@@ -9,7 +9,6 @@ use tonic::metadata::{KeyAndValueRef, MetadataMap};
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
 #[cfg(any(
-    feature = "tls",
     feature = "tls-ring",
     feature = "tls-aws-lc",
     feature = "tls-provider-agnostic"
@@ -52,7 +51,6 @@ pub(crate) struct TonicConfig {
     pub(crate) metadata: Option<MetadataMap>,
     /// TLS settings for the collector endpoint.
     #[cfg(any(
-        feature = "tls",
         feature = "tls-ring",
         feature = "tls-aws-lc",
         feature = "tls-provider-agnostic"
@@ -66,26 +64,24 @@ pub(crate) struct TonicConfig {
     pub(crate) retry_policy: Option<RetryPolicy>,
 }
 
-impl TryFrom<Compression> for tonic::codec::CompressionEncoding {
-    type Error = ExporterBuildError;
-
-    fn try_from(value: Compression) -> Result<Self, ExporterBuildError> {
-        match value {
-            #[cfg(feature = "gzip-tonic")]
-            Compression::Gzip => Ok(tonic::codec::CompressionEncoding::Gzip),
-            #[cfg(not(feature = "gzip-tonic"))]
-            Compression::Gzip => Err(ExporterBuildError::FeatureRequiredForCompressionAlgorithm(
-                "gzip-tonic",
-                Compression::Gzip,
-            )),
-            #[cfg(feature = "zstd-tonic")]
-            Compression::Zstd => Ok(tonic::codec::CompressionEncoding::Zstd),
-            #[cfg(not(feature = "zstd-tonic"))]
-            Compression::Zstd => Err(ExporterBuildError::FeatureRequiredForCompressionAlgorithm(
-                "zstd-tonic",
-                Compression::Zstd,
-            )),
-        }
+fn to_tonic_compression(
+    compression: Compression,
+) -> Result<tonic::codec::CompressionEncoding, ExporterBuildError> {
+    match compression {
+        #[cfg(feature = "gzip-tonic")]
+        Compression::Gzip => Ok(tonic::codec::CompressionEncoding::Gzip),
+        #[cfg(not(feature = "gzip-tonic"))]
+        Compression::Gzip => Err(ExporterBuildError::FeatureRequiredForCompressionAlgorithm(
+            "gzip-tonic",
+            Compression::Gzip,
+        )),
+        #[cfg(feature = "zstd-tonic")]
+        Compression::Zstd => Ok(tonic::codec::CompressionEncoding::Zstd),
+        #[cfg(not(feature = "zstd-tonic"))]
+        Compression::Zstd => Err(ExporterBuildError::FeatureRequiredForCompressionAlgorithm(
+            "zstd-tonic",
+            Compression::Zstd,
+        )),
     }
 }
 
@@ -124,7 +120,7 @@ impl TryFrom<Compression> for tonic::codec::CompressionEncoding {
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct TonicExporterBuilder {
+pub(crate) struct TonicExporterBuilder {
     pub(crate) tonic_config: TonicConfig,
     pub(crate) exporter_config: ExportConfig,
 }
@@ -152,7 +148,6 @@ impl Default for TonicExporterBuilder {
                         .expect("Invalid tonic headers"),
                 )),
                 #[cfg(any(
-                    feature = "tls",
                     feature = "tls-ring",
                     feature = "tls-aws-lc",
                     feature = "tls-provider-agnostic"
@@ -284,7 +279,6 @@ impl TonicExporterBuilder {
             .is_some_and(|s| *s == http::uri::Scheme::HTTPS);
 
         #[cfg(not(any(
-            feature = "tls",
             feature = "tls-ring",
             feature = "tls-aws-lc",
             feature = "tls-provider-agnostic"
@@ -300,7 +294,6 @@ impl TonicExporterBuilder {
             });
         }
         #[cfg(any(
-            feature = "tls",
             feature = "tls-ring",
             feature = "tls-aws-lc",
             feature = "tls-provider-agnostic"
@@ -318,7 +311,6 @@ impl TonicExporterBuilder {
         .connect_lazy();
 
         #[cfg(not(any(
-            feature = "tls",
             feature = "tls-ring",
             feature = "tls-aws-lc",
             feature = "tls-provider-agnostic"
@@ -355,9 +347,11 @@ impl TonicExporterBuilder {
         &self,
         env_override: &str,
     ) -> Result<Option<CompressionEncoding>, ExporterBuildError> {
-        super::resolve_compression_from_env(self.tonic_config.compression, env_override)?
-            .map(|c| c.try_into())
-            .transpose()
+        super::resolve_compression_from_env(
+            self.tonic_config.compression,
+            env_override,
+            to_tonic_compression,
+        )
     }
 
     /// Build a new tonic log exporter
@@ -648,7 +642,6 @@ impl HasTonicConfig for TonicExporterBuilder {
 pub trait WithTonicConfig: super::sealed::WithTonicConfig {
     /// Set the TLS settings for the collector endpoint.
     #[cfg(any(
-        feature = "tls",
         feature = "tls-ring",
         feature = "tls-aws-lc",
         feature = "tls-provider-agnostic"
@@ -767,7 +760,6 @@ impl<B: HasTonicConfig> super::sealed::WithTonicConfig for B {}
 
 impl<B: HasTonicConfig> WithTonicConfig for B {
     #[cfg(any(
-        feature = "tls",
         feature = "tls-ring",
         feature = "tls-aws-lc",
         feature = "tls-provider-agnostic"
@@ -822,7 +814,9 @@ mod tests {
     use crate::exporter::tonic::WithTonicConfig;
     #[cfg(feature = "grpc-tonic")]
     use crate::exporter::Compression;
-    use crate::{TonicExporterBuilder, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT};
+    use crate::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
+
+    use super::TonicExporterBuilder;
     use crate::{OTEL_EXPORTER_OTLP_HEADERS, OTEL_EXPORTER_OTLP_TRACES_HEADERS};
     use http::{HeaderMap, HeaderName, HeaderValue};
     use tonic::metadata::{MetadataMap, MetadataValue};
@@ -932,13 +926,13 @@ mod tests {
     #[test]
     fn test_convert_compression() {
         #[cfg(feature = "gzip-tonic")]
-        assert!(tonic::codec::CompressionEncoding::try_from(Compression::Gzip).is_ok());
+        assert!(super::to_tonic_compression(Compression::Gzip).is_ok());
         #[cfg(not(feature = "gzip-tonic"))]
-        assert!(tonic::codec::CompressionEncoding::try_from(Compression::Gzip).is_err());
+        assert!(super::to_tonic_compression(Compression::Gzip).is_err());
         #[cfg(feature = "zstd-tonic")]
-        assert!(tonic::codec::CompressionEncoding::try_from(Compression::Zstd).is_ok());
+        assert!(super::to_tonic_compression(Compression::Zstd).is_ok());
         #[cfg(not(feature = "zstd-tonic"))]
-        assert!(tonic::codec::CompressionEncoding::try_from(Compression::Zstd).is_err());
+        assert!(super::to_tonic_compression(Compression::Zstd).is_err());
     }
 
     #[cfg(feature = "zstd-tonic")]
@@ -1209,7 +1203,6 @@ mod tests {
     #[cfg(all(
         feature = "trace",
         not(any(
-            feature = "tls",
             feature = "tls-ring",
             feature = "tls-aws-lc",
             feature = "tls-provider-agnostic"
@@ -1244,7 +1237,6 @@ mod tests {
     #[cfg(all(
         feature = "trace",
         not(any(
-            feature = "tls",
             feature = "tls-ring",
             feature = "tls-aws-lc",
             feature = "tls-provider-agnostic"
@@ -1277,7 +1269,6 @@ mod tests {
     #[cfg(all(
         feature = "trace",
         not(any(
-            feature = "tls",
             feature = "tls-ring",
             feature = "tls-aws-lc",
             feature = "tls-provider-agnostic"
@@ -1338,7 +1329,6 @@ mod tests {
 
     #[test]
     #[cfg(not(any(
-        feature = "tls",
         feature = "tls-ring",
         feature = "tls-aws-lc",
         feature = "tls-provider-agnostic"
@@ -1368,7 +1358,6 @@ mod tests {
 
     #[tokio::test]
     #[cfg(any(
-        feature = "tls",
         feature = "tls-ring",
         feature = "tls-aws-lc",
         feature = "tls-provider-agnostic"

@@ -159,6 +159,52 @@ pub enum ExporterBuildError {
     InternalFailure(String),
 }
 
+#[cfg(any(feature = "grpc-tonic", feature = "http-proto", feature = "http-json"))]
+pub(crate) fn read_enum_env_var(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn_ignored_enum_env_var(name, "<non-Unicode>", "value is not valid Unicode");
+            None
+        }
+    }
+}
+
+#[cfg(any(feature = "grpc-tonic", feature = "http-proto", feature = "http-json"))]
+pub(crate) fn warn_ignored_enum_env_var(
+    environment_variable: &str,
+    value: &str,
+    reason: impl std::fmt::Display,
+) {
+    let reason = reason.to_string();
+    let message = format!("Ignoring value '{value}' for {environment_variable}: {reason}");
+    opentelemetry::otel_warn!(
+        name: "Exporter.Config.InvalidEnvironmentVariable",
+        message = message.as_str(),
+        environment_variable = environment_variable,
+        value = value,
+        reason = reason.as_str()
+    );
+}
+
+#[cfg(all(
+    any(feature = "grpc-tonic", feature = "http-proto", feature = "http-json"),
+    not(all(feature = "grpc-tonic", feature = "http-proto", feature = "http-json"))
+))]
+pub(crate) fn warn_missing_protocol_feature(
+    environment_variable: &str,
+    value: &str,
+    feature: &str,
+) {
+    warn_ignored_enum_env_var(
+        environment_variable,
+        value,
+        format!("feature '{feature}' is not enabled"),
+    );
+}
+
 /// The compression algorithm to use when sending data.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,19 +244,31 @@ impl FromStr for Compression {
 /// 3. Generic OTEL_EXPORTER_OTLP_COMPRESSION
 /// 4. None (default)
 #[cfg(any(feature = "http-proto", feature = "http-json", feature = "grpc-tonic"))]
-fn resolve_compression_from_env(
+fn resolve_compression_from_env<T>(
     config_compression: Option<Compression>,
     signal_env_var: &str,
-) -> Result<Option<Compression>, ExporterBuildError> {
+    convert: impl Fn(Compression) -> Result<T, ExporterBuildError>,
+) -> Result<Option<T>, ExporterBuildError> {
     if let Some(compression) = config_compression {
-        Ok(Some(compression))
-    } else if let Ok(compression) = std::env::var(signal_env_var) {
-        Ok(Some(compression.parse::<Compression>()?))
-    } else if let Ok(compression) = std::env::var(OTEL_EXPORTER_OTLP_COMPRESSION) {
-        Ok(Some(compression.parse::<Compression>()?))
-    } else {
-        Ok(None)
+        return convert(compression).map(Some);
     }
+    for name in [signal_env_var, OTEL_EXPORTER_OTLP_COMPRESSION] {
+        let Some(value) = read_enum_env_var(name) else {
+            continue;
+        };
+        if value.eq_ignore_ascii_case("none") {
+            return Ok(None);
+        }
+        match value
+            .to_ascii_lowercase()
+            .parse::<Compression>()
+            .and_then(&convert)
+        {
+            Ok(compression) => return Ok(Some(compression)),
+            Err(error) => warn_ignored_enum_env_var(name, &value, error),
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve whether the connection should be insecure (no TLS).
@@ -301,13 +359,23 @@ pub trait WithExportConfig: sealed::WithExportConfig {
     ///
     /// Note: Programmatically setting this will override any value set via the environment variable.
     fn with_endpoint<T: Into<String>>(self, endpoint: T) -> Self;
-    /// Set the protocol to use when communicating with the collector.
+    /// Set the transport protocol to use when communicating with the collector.
     ///
-    /// Note that protocols that are not supported by exporters will be ignored. The exporter
-    /// will use default protocol in this case.
+    /// This is mainly useful on the HTTP transport to choose between
+    /// [`Protocol::HttpBinary`] (protobuf) and [`Protocol::HttpJson`].
+    /// Setting a protocol that conflicts with the chosen transport
+    /// (e.g. [`Protocol::Grpc`] on an HTTP builder) will cause `build()`
+    /// to return an error.
     ///
-    /// ## Note
-    /// All exporters in this crate only support one protocol, thus choosing the protocol is a no-op at the moment.
+    /// Note that `with_protocol()` is only available after a transport has
+    /// been selected via `.with_http()` or `.with_tonic()`. If you call
+    /// `.builder().build()` directly without selecting a transport, the
+    /// transport is chosen automatically from the
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` environment variable and enabled
+    /// cargo features - `with_protocol()` is not involved in that path.
+    ///
+    /// Note: Programmatically setting this will override any value set via the
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` environment variable.
     fn with_protocol(self, protocol: Protocol) -> Self;
     /// Set the timeout to the collector.
     ///
@@ -410,6 +478,8 @@ fn parse_header_key_value_string(key_value_string: &str) -> Option<(&str, String
 #[cfg(test)]
 #[cfg(any(feature = "grpc-tonic", feature = "http-proto", feature = "http-json"))]
 mod tests {
+    use super::{resolve_compression_from_env, Compression, OTEL_EXPORTER_OTLP_COMPRESSION};
+
     pub(crate) fn run_env_test<T, F>(env_vars: T, f: F)
     where
         F: FnOnce(),
@@ -428,7 +498,7 @@ mod tests {
     #[cfg(any(feature = "http-proto", feature = "http-json"))]
     #[test]
     fn test_default_http_endpoint() {
-        let exporter_builder = crate::HttpExporterBuilder::default();
+        let exporter_builder = crate::exporter::http::HttpExporterBuilder::default();
 
         assert_eq!(exporter_builder.exporter_config.endpoint, None);
     }
@@ -476,7 +546,7 @@ mod tests {
     #[cfg(feature = "grpc-tonic")]
     #[test]
     fn test_default_tonic_endpoint() {
-        let exporter_builder = crate::TonicExporterBuilder::default();
+        let exporter_builder = crate::exporter::tonic::TonicExporterBuilder::default();
 
         assert_eq!(exporter_builder.exporter_config.endpoint, None);
     }
@@ -789,6 +859,85 @@ mod tests {
             let protocol = super::resolve_protocol(crate::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, None);
             assert_eq!(protocol, Protocol::feature_default());
         });
+    }
+
+    #[test]
+    fn compression_env_precedence() {
+        for (signal, generic, expected) in [
+            ("", "gzip", Some(Compression::Gzip)),
+            ("invalid", "GZIP", Some(Compression::Gzip)),
+            ("ZSTD", "gzip", Some(Compression::Zstd)),
+            ("NoNe", "gzip", None),
+            ("invalid", "none", None),
+            ("invalid", "invalid", None),
+        ] {
+            run_env_test(
+                vec![
+                    ("MY_CUSTOM_COMPRESSION_VAR", signal),
+                    (OTEL_EXPORTER_OTLP_COMPRESSION, generic),
+                ],
+                || {
+                    assert_eq!(
+                        resolve_compression_from_env(None, "MY_CUSTOM_COMPRESSION_VAR", Ok)
+                            .unwrap(),
+                        expected,
+                        "signal={signal}, generic={generic}"
+                    )
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_compression_env_falls_back_but_programmatic_config_errors() {
+        run_env_test(
+            vec![
+                ("MY_CUSTOM_COMPRESSION_VAR", "gzip"),
+                (OTEL_EXPORTER_OTLP_COMPRESSION, "zstd"),
+            ],
+            || {
+                let convert = |compression| match compression {
+                    Compression::Gzip => Err(
+                        super::ExporterBuildError::UnsupportedCompressionAlgorithm("gzip".into()),
+                    ),
+                    Compression::Zstd => Ok(compression),
+                };
+                assert_eq!(
+                    resolve_compression_from_env(None, "MY_CUSTOM_COMPRESSION_VAR", convert)
+                        .unwrap(),
+                    Some(Compression::Zstd)
+                );
+                assert!(resolve_compression_from_env(
+                    Some(Compression::Gzip),
+                    "MY_CUSTOM_COMPRESSION_VAR",
+                    convert
+                )
+                .is_err());
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_non_unicode_compression_env_falls_back_to_generic() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        temp_env::with_vars(
+            [
+                (
+                    "MY_CUSTOM_COMPRESSION_VAR",
+                    Some(OsStr::from_bytes(b"\x80")),
+                ),
+                (OTEL_EXPORTER_OTLP_COMPRESSION, Some(OsStr::new("zstd"))),
+            ],
+            || {
+                assert_eq!(
+                    resolve_compression_from_env(None, "MY_CUSTOM_COMPRESSION_VAR", Ok).unwrap(),
+                    Some(Compression::Zstd)
+                );
+            },
+        );
     }
 
     #[cfg(all(feature = "grpc-tonic", feature = "trace"))]
