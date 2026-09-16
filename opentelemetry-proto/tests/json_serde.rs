@@ -1,11 +1,21 @@
 #[cfg(all(feature = "with-serde", feature = "gen-tonic-messages"))]
 mod json_serde {
     #[cfg(feature = "logs")]
-    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::logs::v1::{
+        ExportLogsServiceRequest, ExportLogsServiceResponse,
+    };
     #[cfg(feature = "metrics")]
-    use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::collector::metrics::v1::{
+        ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    };
+    #[cfg(feature = "profiles")]
+    use opentelemetry_proto::tonic::collector::profiles::v1development::{
+        ExportProfilesServiceRequest, ExportProfilesServiceResponse,
+    };
     #[cfg(feature = "trace")]
-    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::collector::trace::v1::{
+        ExportTraceServiceRequest, ExportTraceServiceResponse,
+    };
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
     use opentelemetry_proto::tonic::common::v1::{
         AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList,
@@ -24,9 +34,26 @@ mod json_serde {
         ResourceSpans, ScopeSpans, Span, Status,
     };
 
+    #[cfg(feature = "profiles")]
+    mod export_profiles_service_request {
+        use super::*;
+
+        #[test]
+        fn deserialize_omitted_resource_profiles() {
+            let empty: ExportProfilesServiceRequest = serde_json::from_str("{}").unwrap();
+            assert!(empty.resource_profiles.is_empty());
+        }
+    }
+
     #[cfg(feature = "trace")]
     mod export_trace_service_request {
         use super::*;
+
+        #[test]
+        fn deserialize_omitted_resource_spans() {
+            let empty: ExportTraceServiceRequest = serde_json::from_str("{}").unwrap();
+            assert!(empty.resource_spans.is_empty());
+        }
 
         // `ExportTraceServiceRequest` from the OpenTelemetry proto examples
         // see <https://github.com/open-telemetry/opentelemetry-proto/blob/v1.3.2/examples/trace.json>
@@ -929,6 +956,12 @@ mod json_serde {
     mod export_metrics_service_request {
         use super::*;
 
+        #[test]
+        fn deserialize_omitted_resource_metrics() {
+            let empty: ExportMetricsServiceRequest = serde_json::from_str("{}").unwrap();
+            assert!(empty.resource_metrics.is_empty());
+        }
+
         // `ExportTraceServiceRequest` from the OpenTelemetry proto examples
         // see <https://github.com/open-telemetry/opentelemetry-proto/blob/v1.3.2/examples/metrics.json>
         mod example {
@@ -1319,8 +1352,202 @@ mod json_serde {
     }
 
     #[cfg(feature = "logs")]
+    mod export_logs_service_response {
+        use super::*;
+
+        #[test]
+        fn deserialize_empty_partial_success() {
+            let response: ExportLogsServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_log_records, 0);
+            assert!(partial_success.error_message.is_empty());
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_rejected_log_records() {
+            let response: ExportLogsServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"errorMessage":"backend warning"}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_log_records, 0);
+            assert_eq!(partial_success.error_message, "backend warning");
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_error_message() {
+            let response: ExportLogsServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"rejectedLogRecords":1}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_log_records, 1);
+            assert!(partial_success.error_message.is_empty());
+        }
+    }
+
+    #[cfg(feature = "trace")]
+    mod export_trace_service_response {
+        use super::*;
+
+        #[test]
+        fn deserialize_empty_partial_success() {
+            let response: ExportTraceServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_spans, 0);
+            assert!(partial_success.error_message.is_empty());
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_rejected_spans() {
+            let response: ExportTraceServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"errorMessage":"backend warning"}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_spans, 0);
+            assert_eq!(partial_success.error_message, "backend warning");
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_error_message() {
+            let response: ExportTraceServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"rejectedSpans":1}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_spans, 1);
+            assert!(partial_success.error_message.is_empty());
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    mod export_metrics_service_response {
+        use super::*;
+
+        #[test]
+        fn deserialize_empty_partial_success() {
+            let response: ExportMetricsServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_data_points, 0);
+            assert!(partial_success.error_message.is_empty());
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_rejected_data_points() {
+            let response: ExportMetricsServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"errorMessage":"backend warning"}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_data_points, 0);
+            assert_eq!(partial_success.error_message, "backend warning");
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_error_message() {
+            let response: ExportMetricsServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"rejectedDataPoints":1}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_data_points, 1);
+            assert!(partial_success.error_message.is_empty());
+        }
+    }
+
+    #[cfg(feature = "profiles")]
+    mod export_profiles_service_response {
+        use super::*;
+
+        #[test]
+        fn deserialize_empty_partial_success() {
+            let response: ExportProfilesServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_profiles, 0);
+            assert!(partial_success.error_message.is_empty());
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_rejected_profiles() {
+            let response: ExportProfilesServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"errorMessage":"backend warning"}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_profiles, 0);
+            assert_eq!(partial_success.error_message, "backend warning");
+        }
+
+        #[test]
+        fn deserialize_partial_success_with_omitted_error_message() {
+            let response: ExportProfilesServiceResponse =
+                serde_json::from_str(r#"{"partialSuccess":{"rejectedProfiles":1}}"#)
+                    .expect("deserialization must succeed");
+
+            let partial_success = response
+                .partial_success
+                .expect("partial success must be present");
+
+            assert_eq!(partial_success.rejected_profiles, 1);
+            assert!(partial_success.error_message.is_empty());
+        }
+    }
+
+    #[cfg(feature = "logs")]
     mod export_logs_service_request {
         use super::*;
+
+        #[test]
+        fn deserialize_omitted_resource_logs() {
+            let empty: ExportLogsServiceRequest = serde_json::from_str("{}").unwrap();
+            assert!(empty.resource_logs.is_empty());
+        }
 
         // `ExportTraceServiceRequest` from the OpenTelemetry proto examples
         // see <https://github.com/open-telemetry/opentelemetry-proto/blob/v1.3.2/examples/logs.json>
