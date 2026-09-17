@@ -45,5 +45,7 @@ if rustup component add clippy && \
   cargo_feature opentelemetry-proto "gen-tonic,logs"
   cargo_feature opentelemetry-proto "gen-tonic,logs,with-serde"
   cargo_feature opentelemetry-proto "gen-tonic,logs,with-schemars,with-serde"
-
+else
+  # A failed prerequisite must not make the lint gate report success.
+  exit 1
 fi

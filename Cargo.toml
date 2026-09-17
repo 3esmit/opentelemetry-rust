@@ -85,6 +85,9 @@ pprof = { version = "0.14", features = ["flamegraph", "criterion"] }
 opentelemetry = { path = "opentelemetry" }
 opentelemetry_sdk = { path = "opentelemetry-sdk" }
 opentelemetry-stdout = { path = "opentelemetry-stdout" }
+# Keep subscriber destruction outside the tracing dispatcher registry lock.
+# https://github.com/3esmit/tracing/pull/1
+tracing-core = { git = "https://github.com/3esmit/tracing", rev = "5ed615b90dd8925f7a552f92b572829078f279d8" }
 
 [workspace.lints.rust]
 rust_2024_compatibility = { level = "warn", priority = -1 }

@@ -248,7 +248,7 @@ impl<T> fmt::Debug for HistogramBuilder<'_, T> {
             .field("boundaries", &self.boundaries)
             .field(
                 "kind",
-                &format!("Histogram<{}>", &std::any::type_name::<T>()),
+                &format!("Histogram<{}>", std::any::type_name::<T>()),
             )
             .finish()
     }
