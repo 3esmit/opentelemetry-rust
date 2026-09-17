@@ -2,6 +2,11 @@
 
 ## vNext
 
+- `BatchSpanProcessor` now reports final-export and exporter-shutdown errors
+  from shutdown, while still joining its worker. If both operations fail, the
+  error includes both causes. A multi-batch drain retains its first export
+  error instead of letting a later successful batch hide it.
+
 ## 0.32.1
 
 Released 2026-May-23

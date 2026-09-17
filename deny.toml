@@ -47,7 +47,13 @@ yanked = "deny"
 # `time` is only used transitively in test infrastructure (integration_test_runner → testcontainers → bollard → time).
 # No published crate depends on it. If a published crate ever adds a dependency on `time`,
 # this ignore will silently suppress the advisory — revisit this entry if that happens.
-ignore = [{ id = "RUSTSEC-2026-0009", reason = "currently dev-only via test infra" }]
+ignore = [
+    { id = "RUSTSEC-2026-0009", reason = "currently dev-only via test infra" },
+    # quick-xml is pulled only by the pprof/inferno profiling test tooling; no
+    # published workspace crate includes this parser or accepts its input.
+    { id = "RUSTSEC-2026-0194", reason = "dev-only pprof profiling tooling" },
+    { id = "RUSTSEC-2026-0195", reason = "dev-only pprof profiling tooling" },
+]
 
 # This section is considered when running `cargo deny check bans`.
 # More documentation about the 'bans' section can be found here:
@@ -70,3 +76,6 @@ highlight = "all"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+    "https://github.com/3esmit/tracing",
+]
